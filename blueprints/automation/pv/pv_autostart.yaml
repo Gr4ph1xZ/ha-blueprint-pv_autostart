@@ -1,192 +1,196 @@
 blueprint:
-  name: PV Autostart (Pyscript)
+  name: PV Autostart
   description: >
-    Start/stop a single device from PV surplus with hysteresis, daily targets,
-    and optional forecast override. Positive grid-import sensors are summed.
-    States are validated defensively. Daily counters reset inside Pyscript at 00:00.
-    Surplus approximation path: surplus = max(0, pv_now - sum(import_components)).
+    ### PV Autostart
+
+    This blueprint registers a pyscript service that automatically starts and stops
+    a single appliance based on the available photovoltaic (PV) surplus.  It
+    observes your PV production and grid import sensors and makes decisions
+    according to configurable buffers.  When the surplus has been positive for
+    a defined time, the device will be started; when there is no load or
+    importing from the grid persists, the device will be stopped.  Optionally
+    a minimum run‑time and/or minimum number of cycles per day can be set.
+
+    **Inputs**
+
+    * **switch_entity** – the entity id of the switch controlling the appliance.
+    * **sensor_device_power** – (optional) sensor measuring the current power draw of the device in watts.
+    * **off_after_minutes_without_draw** – (optional) minutes after which the device will be switched off if it draws no power.  This is only checked after the configured minimum cycles have been reached.
+    * **no_draw_threshold_watts** – threshold below which the device is considered to be drawing no power.
+    * **buffer_on_minutes** – number of minutes of continuous PV surplus required before switching on.
+    * **buffer_off_minutes** – number of minutes of continuous PV deficit required before switching off.
+    * **min_runtime_per_day_minutes** – (optional) minimum number of minutes the device should run per day.
+    * **min_cycles_per_day** – (optional) minimum number of script‑initiated cycles per day.
+    * **interruptible** – whether the device is allowed to be interrupted mid‑cycle.  If true, the device may also be stopped if its power draw exceeds the current grid import for the buffer duration.
+    * **sensor_grid_import_components** – one or more sensors that measure positive grid import power.  Their positive values are summed to estimate your total import.
+    * **start_time_if_target_not_met** – a fallback time of day after which the device will be started if the daily targets have not been met.  The optional forecast sensor can postpone this start.
+    * **sensor_forecast_energy_today** – (optional) sensor containing the remaining PV energy forecast for today in kWh.  When provided, it is used to decide whether the fallback start should be postponed.
+    * **sensor_pv_power_now** – sensor measuring your current PV production in watts.
+
+    See the accompanying ``pv_autostart.py`` for a detailed explanation of the logic.
+
   domain: automation
-  source_url: https://example.local/pv_autostart  # optional placeholder
+  input:
+    switch_entity:
+      name: Appliance switch
+      description: >
+        The entity id of the device to be controlled, for example ``switch.pool_pump``.
+      selector:
+        entity:
+          domain: switch
+    sensor_device_power:
+      name: Device power sensor
+      description: >
+        (Optional) Sensor that reports the current power consumption of the device in watts.  If provided,
+        the controller can detect when the device is no longer drawing power and switch it off early.
+      default: ''
+      selector:
+        entity:
+          domain: sensor
+          multiple: false
+    off_after_minutes_without_draw:
+      name: Off after minutes without draw
+      description: >
+        (Optional) Number of minutes the device is allowed to draw less than the specified
+        "no draw" threshold before it is switched off.  This delay helps avoid turning off
+        devices that intermittently drop below the threshold.
+      default: ''
+      selector:
+        number:
+          min: 0
+          max: 1440
+          mode: box
+          unit_of_measurement: min
+    no_draw_threshold_watts:
+      name: No draw threshold (W)
+      description: >
+        Power in watts below which the device is considered idle.  When the device draws less than
+        this amount of power for the configured duration, it will be turned off (subject to the
+        minimum cycles constraint).
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 5000
+          mode: box
+          unit_of_measurement: W
+    buffer_on_minutes:
+      name: Buffer on (min)
+      description: >
+        Number of consecutive minutes of PV surplus required before the device is switched on.  This
+        hysteresis prevents rapid toggling when the surplus fluctuates.
+      default: 3
+      selector:
+        number:
+          min: 0
+          max: 120
+          mode: box
+          unit_of_measurement: min
+    buffer_off_minutes:
+      name: Buffer off (min)
+      description: >
+        Number of consecutive minutes of PV deficit required before the device is switched off.  This
+        hysteresis prevents rapid toggling when the surplus fluctuates.
+      default: 4
+      selector:
+        number:
+          min: 0
+          max: 120
+          mode: box
+          unit_of_measurement: min
+    min_runtime_per_day_minutes:
+      name: Minimum runtime per day (min)
+      description: >
+        (Optional) Minimum number of minutes the device should run each day.  When specified, the
+        controller will ensure the device runs for at least this amount of time by honouring the
+        fallback start time.
+      default: ''
+      selector:
+        number:
+          min: 0
+          max: 1440
+          mode: box
+          unit_of_measurement: min
+    min_cycles_per_day:
+      name: Minimum cycles per day
+      description: >
+        (Optional) Minimum number of script‑initiated cycles the device should run each day.  Only cycles
+        started by this automation are counted.
+      default: ''
+      selector:
+        number:
+          min: 0
+          max: 10
+          mode: box
+    interruptible:
+      name: Interruptible
+      description: >
+        If true, the device may be interrupted while running.  When enabled, the controller will
+        also stop the device when its power draw exceeds the current grid import for the configured
+        buffer duration.  Set to false if the device should always complete its cycle once started.
+      default: false
+      selector:
+        boolean: {}
+    sensor_grid_import_components:
+      name: Grid import sensors
+      description: >
+        One or more sensors that report positive grid import power.  The controller sums the
+        positive values from these sensors to estimate your current import.  Only the positive
+        portions of each sensor are considered; negative values (export) are ignored.
+      selector:
+        entity:
+          domain: sensor
+          multiple: true
+    start_time_if_target_not_met:
+      name: Fallback start time
+      description: >
+        Time of day after which the device will be started if the daily runtime or cycle targets
+        have not yet been met.  When a forecast sensor is provided, it may override this time to
+        delay the forced start until later in the day.
+      default: '00:00'
+      selector:
+        time: {}
+    sensor_forecast_energy_today:
+      name: Forecast energy sensor
+      description: >
+        (Optional) Sensor providing the remaining forecast PV energy for today in kilowatt‑hours.  When
+        provided, the controller uses this value to postpone forced starts when enough energy is
+        expected later in the day.
+      default: ''
+      selector:
+        entity:
+          domain: sensor
+          multiple: false
+    sensor_pv_power_now:
+      name: PV power sensor
+      description: >
+        Sensor reporting your current PV production in watts.  This sensor is required and should be
+        updated frequently (at least once per minute) for accurate control.
+      selector:
+        entity:
+          domain: sensor
+          multiple: false
 
-# ------------------------------- Inputs ---------------------------------------
-input:
-  switch_entity:
-    name: Switch to control
-    description: Entity to be switched (e.g. switch.pool_pump)
-    selector:
-      entity:
-        filter:
-          - domain: switch
-  sensor_device_power:
-    name: Device power (W) [optional]
-    description: Sensor of the device's instantaneous power draw in watts
-    default: ''
-    selector:
-      entity:
-        filter:
-          - domain: sensor
-  off_after_minutes_without_draw:
-    name: Turn off after minutes without draw [optional]
-    description: Minutes of continuous "no draw" before switching off
-    default: 0
-    selector:
-      number:
-        min: 0
-        max: 240
-        step: 1
-        unit_of_measurement: min
-        mode: slider
-  no_draw_threshold_watts:
-    name: "No draw" threshold (W)
-    description: Device power <= threshold counts as "no draw"
-    selector:
-      number:
-        min: 0
-        max: 5000
-        step: 1
-        unit_of_measurement: W
-  buffer_on_minutes:
-    name: On buffer (minutes)
-    description: Continuous surplus required before switching on
-    selector:
-      number:
-        min: 0
-        max: 60
-        step: 1
-        unit_of_measurement: min
-  buffer_off_minutes:
-    name: Off buffer (minutes)
-    description: Continuous import/deficit required before switching off
-    selector:
-      number:
-        min: 0
-        max: 60
-        step: 1
-        unit_of_measurement: min
-  min_runtime_per_day_minutes:
-    name: Minimum runtime per day [optional]
-    description: Target runtime to achieve daily before stopping
-    default: 0
-    selector:
-      number:
-        min: 0
-        max: 1440
-        step: 1
-        unit_of_measurement: min
-  min_cycles_per_day:
-    name: Minimum auto-start cycles per day [optional]
-    description: Only cycles started by this blueprint count
-    default: 0
-    selector:
-      number:
-        min: 0
-        max: 20
-        step: 1
-  interruptible:
-    name: Device may be interrupted
-    description: If true, the controller can stop the device when importing power
-    selector:
-      boolean: {}
-  sensor_grid_import_components:
-    name: Grid import components (positive) [one or more]
-    description: >
-      List of positive power sensors to sum up total grid import (W).
-      Missing/unavailable values are treated as 0.
-    selector:
-      entity:
-        multiple: true
-        filter:
-          - domain: sensor
-  start_time_if_target_not_met:
-    name: Fallback start time if targets not met (local time)
-    description: >
-      HH:MM or HH:MM:SS. If targets are not met by this time, the device will be
-      forced to start, unless the forecast predicts enough energy later.
-    selector:
-      time: {}
-  sensor_forecast_energy_today:
-    name: Remaining PV energy today (kWh) [optional]
-    description: >
-      If provided, the controller may delay or advance the forced start based on
-      this remaining energy forecast.
-    default: ''
-    selector:
-      entity:
-        filter:
-          - domain: sensor
-  sensor_pv_power_now:
-    name: PV power now (W)
-    description: Current PV production power in watts
-    selector:
-      entity:
-        filter:
-          - domain: sensor
-
-# -------------------------------- Triggers ------------------------------------
+mode: restart
 trigger:
   - platform: homeassistant
     event: start
-  - platform: time_pattern
-    minutes: "/10"
-
-# -------------------------------- Actions -------------------------------------
-variables:
-  v_switch_entity: !input switch_entity
-  v_sensor_device_power: !input sensor_device_power
-  v_off_after_minutes_without_draw: !input off_after_minutes_without_draw
-  v_no_draw_threshold_watts: !input no_draw_threshold_watts
-  v_buffer_on_minutes: !input buffer_on_minutes
-  v_buffer_off_minutes: !input buffer_off_minutes
-  v_min_runtime_per_day_minutes: !input min_runtime_per_day_minutes
-  v_min_cycles_per_day: !input min_cycles_per_day
-  v_interruptible: !input interruptible
-  v_sensor_grid_import_components: !input sensor_grid_import_components
-  v_start_time_if_target_not_met: !input start_time_if_target_not_met
-  v_sensor_forecast_energy_today: !input sensor_forecast_energy_today
-  v_sensor_pv_power_now: !input sensor_pv_power_now
 
 action:
   - service: pyscript.pv_autostart
     data:
-      automation_id: "{{ this.entity_id }}"
-      switch_entity: "{{ v_switch_entity }}"
-      sensor_device_power: "{{ v_sensor_device_power if v_sensor_device_power != '' else None }}"
-      off_after_minutes_without_draw: "{{ v_off_after_minutes_without_draw if v_off_after_minutes_without_draw|int > 0 else None }}"
-      no_draw_threshold_watts: "{{ v_no_draw_threshold_watts }}"
-      buffer_on_minutes: "{{ v_buffer_on_minutes }}"
-      buffer_off_minutes: "{{ v_buffer_off_minutes }}"
-      min_runtime_per_day_minutes: "{{ v_min_runtime_per_day_minutes if v_min_runtime_per_day_minutes|int > 0 else None }}"
-      min_cycles_per_day: "{{ v_min_cycles_per_day if v_min_cycles_per_day|int > 0 else None }}"
-      interruptible: "{{ v_interruptible }}"
-      sensor_grid_import_components: "{{ v_sensor_grid_import_components }}"
-      start_time_if_target_not_met: "{{ v_start_time_if_target_not_met }}"
-      sensor_forecast_energy_today: "{{ v_sensor_forecast_energy_today if v_sensor_forecast_energy_today != '' else None }}"
-      sensor_pv_power_now: "{{ v_sensor_pv_power_now }}"
-
-mode: restart
-max_exceeded: silent
-
-# ----------------------------- Example (comment) ------------------------------
-# Example inputs (copy into UI as needed):
-# switch_entity: switch.pool_pump
-# sensor_device_power: sensor.pool_pump_power
-# no_draw_threshold_watts: 15
-# off_after_minutes_without_draw: 5
-# buffer_on_minutes: 3
-# buffer_off_minutes: 4
-# interruptible: true
-# sensor_grid_import_components:
-#   - sensor.netzbezug_phase_l1
-#   - sensor.netzbezug_phase_l2
-# start_time_if_target_not_met: "15:30"
-# sensor_forecast_energy_today: sensor.pv_forecast_remaining_kwh
-# sensor_pv_power_now: sensor.pv_power_now
-# min_runtime_per_day_minutes: 60
-# min_cycles_per_day: 1
-
-# Notes:
-# - Household load approximation: surplus = max(0, pv_now - sum(import_components)).
-#   This avoids requiring a dedicated "household load" sensor and keeps behavior
-#   stable even when some components briefly go unavailable.
-# - A minimal switch cooldown is enforced in the Pyscript to protect relays.
-# - The controller logs explicitly when the forecast overrides the start time.
+      # Use the automation entity id to create a unique automation id for the script
+      automation_id: '{{ this.entity_id }}'
+      switch_entity: !input switch_entity
+      sensor_device_power: !input sensor_device_power
+      off_after_minutes_without_draw: !input off_after_minutes_without_draw
+      no_draw_threshold_watts: !input no_draw_threshold_watts
+      buffer_on_minutes: !input buffer_on_minutes
+      buffer_off_minutes: !input buffer_off_minutes
+      min_runtime_per_day_minutes: !input min_runtime_per_day_minutes
+      min_cycles_per_day: !input min_cycles_per_day
+      interruptible: !input interruptible
+      sensor_grid_import_components: !input sensor_grid_import_components
+      start_time_if_target_not_met: !input start_time_if_target_not_met
+      sensor_forecast_energy_today: !input sensor_forecast_energy_today
+      sensor_pv_power_now: !input sensor_pv_power_now
