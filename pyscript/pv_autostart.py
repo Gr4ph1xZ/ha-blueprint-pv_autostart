@@ -171,19 +171,16 @@ def _replace_vowels(input_str: str) -> str:
 
 def _normalise_id(text: str) -> str:
     """
-    Normalise an arbitrary string into a valid automation identifier.  All
-    whitespace is replaced with underscores, dots are replaced with
-    underscores and umlaut vowels are normalised.  The returned id is
-    lower‑case and prefixed with ``automation.``.
-
-    :param text: The input string
-    :return: A sanitised automation id
+    Turn arbitrary text into a clean automation id. If it already starts with
+    'automation.', keep that but strip it before normalizing to avoid duplicates.
     """
-    cleaned = _replace_vowels(text.strip().replace(' ', '_').replace('.', '_'))
-    cleaned = cleaned.lower()
-    if not cleaned.startswith('automation.'):
-        cleaned = f"automation.{cleaned}"
-    return cleaned
+    raw = (text or "").strip()
+    if raw.startswith("automation."):
+        raw = raw[len("automation."):]
+    # normalize: umlauts, spaces, dots
+    raw = _replace_vowels(raw).replace(" ", "_").replace(".", "_").lower()
+    return f"automation.{raw}"
+
 
 
 def _sum_positive_states(entities: List[str]) -> float:
@@ -827,3 +824,25 @@ def pv_autostart(
             sensor_pv_power_now=sensor_pv_power_now,
         )
         log.info(f"[{switch_entity} {automation_id}] Updated existing PvAutostart instance.")
+
+@service
+def pv_autostart_dump(automation_id: str):
+    entry = PvAutostart.instances.get(automation_id)
+    if not entry:
+        log.warning(f"[{automation_id}] dump: no instance found")
+        return
+    inst = entry["instance"]
+    pv = _get_num_state(inst.sensor_pv_power_now, 0) or 0.0
+    imp = 0.0
+    for e in inst.sensor_grid_import_components:
+        v = _get_num_state(e, 0) or 0.0
+        if v > 0:
+            imp += v
+    dev = _get_num_state(inst.sensor_device_power, None) if inst.sensor_device_power else None
+    log.info(
+        f"{inst.log_prefix} DUMP → pv={pv:.0f}W, import={imp:.0f}W, dev={dev}, "
+        f"surplus={max(0.0, pv - imp):.0f}W, "
+        f"counters: on={inst.on_counter_sec}s no_draw={inst.no_draw_counter_sec}s "
+        f"imp_off={inst.import_off_counter_sec}s pv_def={inst.pv_deficit_counter_sec}s; "
+        f"runtime={inst.daily_run_time_sec / 60:.1f}min cycles={inst.cycles_today}"
+    )
