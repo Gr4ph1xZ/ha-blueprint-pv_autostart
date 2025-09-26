@@ -25,6 +25,7 @@ blueprint:
     * **sensor_grid_import_components** - one or more sensors that measure positive grid import power.  Their positive values are summed to estimate your total import.
     * **start_time_if_target_not_met** - a fallback time of day after which the device will be started if the daily targets have not been met.  The optional forecast sensor can postpone this start.
     * **scheduled_turn_off_time** - (optional) time of day (HH:MM) after which the controller attempts to switch the device off once daily targets are satisfied. Leave blank to disable the scheduled stop.
+    * **required_daily_energy_kwh** - (optional) PV energy in kWh the appliance should receive each day. When set, the automation forces a start if the remaining forecast drops below this value.
     * **sensor_forecast_energy_today** - (optional) sensor containing the remaining PV energy forecast for today in kWh.  When provided, it is used to decide whether the fallback start should be postponed.
     * **sensor_pv_power_now** - sensor measuring your current PV production in watts.
 
@@ -191,6 +192,21 @@ blueprint:
       selector:
         time: {}
 
+    required_daily_energy_kwh:
+      name: Required PV energy (kWh)
+      description: >
+        (Optional) Minimum PV energy the appliance should receive today in kilowatt-hours. When set,
+        the automation forces a start if the remaining PV forecast falls below this amount, even without
+        current surplus.
+      default: ''
+      selector:
+        number:
+          min: 0
+          max: 50
+          step: 0.1
+          mode: box
+          unit_of_measurement: kWh
+
     force_turn_off_if_target_unreached:
       name: Force turn off even if target unmet
       description: >
@@ -227,3 +243,4 @@ action:
       exclude_blueprint_turn_on_from_counters: !input exclude_blueprint_turn_on_from_counters
       scheduled_turn_off_time: !input scheduled_turn_off_time
       force_turn_off_if_target_unreached: !input force_turn_off_if_target_unreached
+      required_daily_energy_kwh: !input required_daily_energy_kwh

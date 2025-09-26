@@ -16,6 +16,7 @@ This repository contains a Home Assistant blueprint and companion Pyscript modul
 - **Buffer windows** (`buffer_on_minutes`, `buffer_off_minutes`) prevent rapid toggling by requiring surplus/deficit conditions to persist.
 - **Fallback start** (`start_time_if_target_not_met`) and **scheduled stop** (`scheduled_turn_off_time`) act as bookends when daily targets are not yet satisfied. Forced turn-off can override unmet targets via `force_turn_off_if_target_unreached`.
 - **Manual counting** (`exclude_blueprint_turn_on_from_counters`) determines whether manual device starts increment daily runtime/cycle counters. Blueprint-triggered starts always count.
+- **Energy budget** (`required_daily_energy_kwh`) lets you specify how much PV energy (kWh) the appliance should receive today; the controller will force a start when the forecast drops below this amount even without active surplus.
 - **Interruptible loads** allow early stop when device draw exceeds grid import during deficit periods.
 
 ## Logging & Observability
@@ -23,3 +24,4 @@ The pyscript uses structured log levels: `DEBUG` records decision details (surpl
 
 ## Contributing
 When altering logic, ensure new behaviours remain deterministic across the 30-second evaluation tick and respect existing hysteresis counters. Update both the blueprint input descriptions and service docstrings when adding parameters, and keep manual/manual-count semantics aligned between YAML and Python. Consider capturing traces for edge cases (e.g., intermittent PV, manual overrides) under `docs/` to aid future contributors.
+

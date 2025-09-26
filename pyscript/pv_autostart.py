@@ -47,6 +47,7 @@ running concurrently.  Comments and logging are written in English.
 from typing import List, Optional, Dict, Any, Union, Tuple
 import datetime
 
+
 # Prefix used for all log messages originating from this module.  Using a
 # constant prefix makes it easy to filter and search for messages related to
 # this blueprint.  The prefix is prepended to the per‑instance log prefix
@@ -247,6 +248,7 @@ class PvAutostart:
         exclude_blueprint_turn_on_from_counters: bool = False,
         turn_off_time: Optional[datetime.time] = None,
         force_turn_off_if_target_unreached: bool = False,
+        required_daily_energy_kwh: Optional[float] = None,
     ):
         self._hb = 0  # heartbeat counter
 
@@ -304,6 +306,7 @@ class PvAutostart:
         self.force_turn_off_if_target_unreached: bool = bool(
             force_turn_off_if_target_unreached
         )
+        self.required_daily_energy_kwh: Optional[float] = required_daily_energy_kwh
 
         # Runtime state variables
         self.running_since: Optional[datetime.datetime] = None  # Timestamp when the current run began
@@ -311,6 +314,7 @@ class PvAutostart:
         self.current_run_counts: bool = False  # True when the current run contributes to runtime/cycle counters
         self.daily_run_time_sec: float = 0.0  # Accumulated run time in seconds for today (counted runs)
         self.cycles_today: int = 0  # Count of cycles credited to today's targets
+        self.estimated_device_power_watts: Optional[float] = None  # Last observed meaningful device power reading
 
         # Hysteresis counters (seconds)
         self.on_counter_sec: float = 0.0  # Surplus positive duration
@@ -319,30 +323,7 @@ class PvAutostart:
         self.pv_deficit_counter_sec: float = 0.0  # Duration where PV surplus <= 0 while device is running
 
         # Register periodic triggers only once per instance
-        self._setup_triggers()
         log.info(f"{self.log_prefix} Registered instance; ticker every {self.TICK_INTERVAL_SECONDS}s")
-
-    def _setup_triggers(self) -> None:
-        """
-        Create the periodic time trigger that evaluates this instance.  The
-        trigger references ``self`` via closure and must therefore be defined
-        inside this method.  Calling this method multiple times for the same
-        instance will create multiple triggers, so it should only be
-        invoked in the constructor.
-        """
-        interval = self.TICK_INTERVAL_SECONDS
-
-        @time_trigger(f"period(now, {interval}s)")
-        def _on_tick():
-            # Ensure the instance still exists and is registered
-            inst_entry = PvAutostart.instances.get(self.automation_id)
-            if inst_entry is None or inst_entry.get('instance') is not self:
-                return _on_tick
-            try:
-                self._tick()
-            except Exception as e:
-                log.error(f"{self.log_prefix} Exception in tick: {e}")
-            return _on_tick
 
     # ----------------------------------------------------------------------
     # Public interface
@@ -365,6 +346,7 @@ class PvAutostart:
         exclude_blueprint_turn_on_from_counters: Optional[bool] = None,
         turn_off_time: Optional[datetime.time] = None,
         force_turn_off_if_target_unreached: Optional[bool] = None,
+        required_daily_energy_kwh: Optional[float] = None,
     ) -> None:
         """
         Update the configuration parameters of this instance.  This allows
@@ -402,6 +384,7 @@ class PvAutostart:
         self.sensor_forecast_energy_today = sensor_forecast_energy_today or None
         self.sensor_pv_power_now = sensor_pv_power_now
 
+
         # Extended parameters
         if exclude_blueprint_turn_on_from_counters is not None:
             self.exclude_manual_starts_from_counters = bool(
@@ -415,6 +398,14 @@ class PvAutostart:
             self.force_turn_off_if_target_unreached = bool(
                 force_turn_off_if_target_unreached
             )
+
+        if required_daily_energy_kwh is None:
+            self.required_daily_energy_kwh = None
+        else:
+            try:
+                self.required_daily_energy_kwh = max(0.0, float(required_daily_energy_kwh))
+            except (TypeError, ValueError):
+                log.error(f"{self.log_prefix} Invalid required_daily_energy_kwh update: {required_daily_energy_kwh}; keeping previous value.")
 
     # ----------------------------------------------------------------------
     # Core logic
@@ -463,6 +454,12 @@ class PvAutostart:
                     log.debug(
                         f"{self.log_prefix} manual start detected; counting towards targets (cycle {self.cycles_today})."
                     )
+
+            if device_power is not None and device_power > self.no_draw_threshold_watts:
+                self.estimated_device_power_watts = device_power
+
+            if device_power is not None and device_power > self.no_draw_threshold_watts:
+                self.estimated_device_power_watts = device_power
 
             # Update counters
             # 1. No draw counter
@@ -539,6 +536,10 @@ class PvAutostart:
         elif state_now == 'off':
             # Reset counters that only apply when device is running
             self.no_draw_counter_sec = 0.0
+            if device_power is not None and device_power > self.no_draw_threshold_watts:
+                self.estimated_device_power_watts = device_power
+            if device_power is not None and device_power > self.no_draw_threshold_watts:
+                self.estimated_device_power_watts = device_power
             self.import_off_counter_sec = 0.0
             self.pv_deficit_counter_sec = 0.0
 
@@ -615,6 +616,8 @@ class PvAutostart:
             self.pv_deficit_counter_sec = 0.0
             self.on_counter_sec = 0.0
             log.info(f"{self.log_prefix} Device switched OFF.")
+
+
 
     # ----------------------------------------------------------------------
     # Decision helpers
@@ -724,65 +727,111 @@ class PvAutostart:
         return True
 
     def need_to_force_run_for_targets(self, now: datetime.datetime) -> bool:
-        """
-        Evaluate whether to force start the device in order to achieve the
-        configured daily run‑time or cycle targets.  This method consults
-        the optional forecast sensor: if the forecasted remaining PV energy
-        appears sufficient to meet the targets, the forced start is
-        postponed.  Otherwise the start is scheduled at or after
-        ``start_time_if_target_not_met``.
+        """Determine whether the device should be started to fulfil daily targets."""
+        forecast_kwh: Optional[float] = None
+        if self.sensor_forecast_energy_today:
+            forecast_kwh = _get_num_state(self.sensor_forecast_energy_today, return_on_error=None)
 
-        :param now: The current datetime
-        :return: True if the device should be started immediately
-        """
-        # Determine if any targets are configured and unmet
         runtime_target_unmet = False
         cycles_target_unmet = False
         remaining_runtime_min = 0.0
-        # Run‑time target
+
         if self.min_runtime_per_day_minutes is not None:
             current_runtime_min = self.daily_run_time_sec / 60.0
             if current_runtime_min < self.min_runtime_per_day_minutes:
                 runtime_target_unmet = True
                 remaining_runtime_min = max(0.0, self.min_runtime_per_day_minutes - current_runtime_min)
-        # Cycle target
+
         if self.min_cycles_per_day is not None:
             if self.cycles_today < self.min_cycles_per_day:
                 cycles_target_unmet = True
-        if not runtime_target_unmet and not cycles_target_unmet:
-            return False  # All targets already met
 
-        # If a forecast sensor is provided, evaluate remaining energy
-        if self.sensor_forecast_energy_today:
-            forecast_kwh = _get_num_state(self.sensor_forecast_energy_today, return_on_error=None)
-            if forecast_kwh is not None:
-                # Estimate remaining energy required based on device power and remaining runtime
-                energy_needed_kwh = 0.0
-                if runtime_target_unmet and self.sensor_device_power:
-                    current_power = _get_num_state(self.sensor_device_power, return_on_error=None)
-                    if current_power is not None and current_power > 0:
-                        # Convert power [W] * time [h]
-                        energy_needed_kwh = (current_power / 1000.0) * (remaining_runtime_min / 60.0)
-                # If forecasted energy is greater than or equal to required energy, postpone forced start
-                if forecast_kwh >= energy_needed_kwh:
-                    # There is enough forecast energy – only enforce start time if forecast energy becomes insufficient
-                    log.debug(f"{self.log_prefix} Forecast {forecast_kwh:.2f} kWh >= needed {energy_needed_kwh:.2f} kWh; "
-                              f"postponing forced start.")
-                    # However, if cycles target is unmet but no runtime target exists, there is no energy requirement;
-                    # therefore we only postpone if forecast is strictly positive, otherwise we proceed to time check below.
-                    if energy_needed_kwh > 0 or forecast_kwh > 0:
-                        return False
-        # Evaluate start time
-        # Construct today's datetime for start_time
+        energy_needed_kwh = 0.0
+        if runtime_target_unmet:
+            power_for_estimation: Optional[float] = None
+            if self.sensor_device_power:
+                current_power = _get_num_state(self.sensor_device_power, return_on_error=None)
+                if current_power is not None and current_power > self.no_draw_threshold_watts:
+                    power_for_estimation = current_power
+                elif self.estimated_device_power_watts is not None:
+                    power_for_estimation = self.estimated_device_power_watts
+                    log.debug(f"{self.log_prefix} Using last observed device power {power_for_estimation:.1f} W for energy estimation.")
+                else:
+                    log.debug(f"{self.log_prefix} Runtime target unmet but device power unavailable; assuming 0 kWh required.")
+            else:
+                log.debug(f"{self.log_prefix} Runtime target unmet but no device power sensor configured; skipping energy estimation.")
+
+            if power_for_estimation is not None:
+                energy_needed_kwh = (power_for_estimation / 1000.0) * (remaining_runtime_min / 60.0)
+        else:
+            if self.min_runtime_per_day_minutes is None:
+                log.debug(f"{self.log_prefix} No runtime target configured; energy requirement for forecast comparison is 0 kWh.")
+
+        if runtime_target_unmet or cycles_target_unmet:
+            if forecast_kwh is not None and energy_needed_kwh > 0.0 and forecast_kwh >= energy_needed_kwh:
+                log.debug(
+                    f"{self.log_prefix} Forecast {forecast_kwh:.2f} kWh covers runtime need {energy_needed_kwh:.2f} kWh; waiting."
+                )
+                return False
+
+            try:
+                start_datetime = datetime.datetime.combine(now.date(), self.start_time_if_target_not_met)
+            except Exception:
+                start_datetime = datetime.datetime.combine(now.date(), datetime.time(0, 0))
+
+            if now >= start_datetime:
+                log.debug(f"{self.log_prefix} Fallback start time reached with targets unmet; forcing start.")
+                return True
+
+            log.debug(f"{self.log_prefix} Targets unmet but fallback time not reached; deferring force start.")
+            return False
+
+        if self.required_daily_energy_kwh is not None:
+            if forecast_kwh is None:
+                log.debug(
+                    f"{self.log_prefix} Required daily energy {self.required_daily_energy_kwh:.2f} kWh set but no forecast available; using fallback time."
+                )
+            elif forecast_kwh < self.required_daily_energy_kwh:
+                log.debug(
+                    f"{self.log_prefix} Forecast {forecast_kwh:.2f} kWh below required daily energy {self.required_daily_energy_kwh:.2f} kWh; forcing start."
+                )
+                return True
+            else:
+                log.debug(
+                    f"{self.log_prefix} Forecast {forecast_kwh:.2f} kWh still above required daily energy {self.required_daily_energy_kwh:.2f} kWh; waiting."
+                )
+                return False
+        else:
+            if forecast_kwh is not None and forecast_kwh <= 0.0:
+                log.debug(f"{self.log_prefix} Forecast indicates no remaining PV energy; forcing start.")
+                return True
+
         try:
-            start_time = self.start_time_if_target_not_met
-            start_datetime = datetime.datetime.combine(now.date(), start_time)
+            start_datetime = datetime.datetime.combine(now.date(), self.start_time_if_target_not_met)
         except Exception:
-            # If parsing fails, default to midnight
             start_datetime = datetime.datetime.combine(now.date(), datetime.time(0, 0))
         if now >= start_datetime:
+            log.debug(f"{self.log_prefix} Fallback start time reached; forcing start.")
             return True
         return False
+
+
+
+@time_trigger('period(now, 30s)')
+def _pv_autostart_tick(trigger_time=None):
+    """Periodic dispatcher that evaluates all registered PvAutostart instances."""
+    entries = list(PvAutostart.instances.items())
+    if not entries:
+        return
+    log.debug(f"{MODULE_PREFIX} global tick {trigger_time}: evaluating {len(entries)} instance(s)")
+    for automation_id, entry in entries:
+        inst = entry.get('instance')
+        if not inst:
+            continue
+        try:
+            inst._tick()
+        except Exception as exc:
+            log.error(f"{inst.log_prefix} Exception during periodic evaluation: {exc}")
 
 
 # -----------------------------------------------------------------------------
@@ -805,6 +854,7 @@ def reset_pv_autostart_counters():
             inst.running_since = None
             inst.started_by_script = False
             inst.current_run_counts = False
+            inst.estimated_device_power_watts = None
             inst.on_counter_sec = 0.0
             inst.no_draw_counter_sec = 0.0
             inst.import_off_counter_sec = 0.0
@@ -834,6 +884,7 @@ def pv_autostart(
     exclude_blueprint_turn_on_from_counters: Optional[bool] = None,
     scheduled_turn_off_time: Optional[str] = None,
     force_turn_off_if_target_unreached: Optional[bool] = None,
+    required_daily_energy_kwh: Optional[float] = None,
 ) -> None:
     """
     Register or update a PV autostart automation.  When invoked from the
@@ -861,13 +912,15 @@ def pv_autostart(
         mirroring the fallback start behaviour.  Leave blank to disable the scheduled turn off.
     :param force_turn_off_if_target_unreached: When true, the device will be turned off at the scheduled turn off
         time even if the configured minimum runtime or cycle targets have not yet been met.  Default is False.
+    :param required_daily_energy_kwh: Optional energy requirement for the device in kWh. When set, the automation will force a start if the forecasted PV energy remaining for today drops below this value.
     """
     log.info(
         f"{MODULE_PREFIX} pv_autostart service called with: "
         f"automation_id={automation_id}, switch={switch_entity}, pv={sensor_pv_power_now}, "
         f"import_sensors={sensor_grid_import_components}, buffers(on/off)={buffer_on_minutes}/{buffer_off_minutes} min, "
         f"exclude_from_counters={exclude_blueprint_turn_on_from_counters}, scheduled_turn_off_time={scheduled_turn_off_time}, "
-        f"force_turn_off_if_target_unreached={force_turn_off_if_target_unreached}"
+        f"force_turn_off_if_target_unreached={force_turn_off_if_target_unreached}, "
+        f"required_daily_energy_kwh={required_daily_energy_kwh}"
     )
 
     # Basic validation and normalisation of inputs
@@ -886,6 +939,13 @@ def pv_autostart(
     # Normalise extended booleans
     exclude_flag = bool(exclude_blueprint_turn_on_from_counters) if exclude_blueprint_turn_on_from_counters is not None else False
     force_turn_off_flag = bool(force_turn_off_if_target_unreached) if force_turn_off_if_target_unreached is not None else False
+    energy_target_kwh: Optional[float] = None
+    if required_daily_energy_kwh not in [None, '']:
+        try:
+            energy_target_kwh = max(0.0, float(required_daily_energy_kwh))
+        except (TypeError, ValueError):
+            log.error(f"{MODULE_PREFIX} Invalid required_daily_energy_kwh: {required_daily_energy_kwh}; ignoring energy requirement")
+            energy_target_kwh = None
     # Parse scheduled turn-off time (mirrors fallback start behaviour).  Accepts ``HH:MM`` or ``HH:MM:SS``.
     turn_off_time: Optional[datetime.time] = None
     if scheduled_turn_off_time is not None:
@@ -960,6 +1020,7 @@ def pv_autostart(
             exclude_blueprint_turn_on_from_counters=exclude_flag,
             turn_off_time=turn_off_time,
             force_turn_off_if_target_unreached=force_turn_off_flag,
+            required_daily_energy_kwh=energy_target_kwh,
         )
         PvAutostart.instances[automation_id] = {'instance': inst}
         log.info(f"{MODULE_PREFIX} [{switch_entity} {automation_id}] Created new PvAutostart instance.")
@@ -982,6 +1043,7 @@ def pv_autostart(
             exclude_blueprint_turn_on_from_counters=exclude_flag,
             turn_off_time=turn_off_time,
             force_turn_off_if_target_unreached=force_turn_off_flag,
+            required_daily_energy_kwh=energy_target_kwh,
         )
         log.info(f"{MODULE_PREFIX} [{switch_entity} {automation_id}] Updated existing PvAutostart instance.")
 
