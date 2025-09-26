@@ -1,0 +1,4 @@
+- name: ollama_chat/qwen2.5-coder:14b
+  extra_params:
+    num_ctx: 65536
+    temperature: 0.2
