@@ -285,11 +285,11 @@ class PvAutostart:
         self.sensor_pv_power_now: str = sensor_pv_power_now
 
         # Extended configuration
-        # When true, script‑initiated runs will not increment the cycle or
-        # run‑time counters.  This allows the user to exclude certain runs
-        # from the daily targets.  Default is False to preserve previous
-        # behaviour.
-        self.exclude_blueprint_turn_on_from_counters: bool = bool(
+        # When true, manual device starts will not increment the cycle or
+        # run-time counters; blueprint-triggered starts always count.
+        # Use this to prevent ad-hoc/manual toggles from skewing targets.
+        # Default is False to preserve previous behaviour.
+        self.exclude_manual_starts_from_counters: bool = bool(
             exclude_blueprint_turn_on_from_counters
         )
         # Optional time of day after which the device should be turned off.
@@ -306,10 +306,11 @@ class PvAutostart:
         )
 
         # Runtime state variables
-        self.running_since: Optional[datetime.datetime] = None  # When the device was last started by this script
-        self.started_by_script: bool = False  # Whether current run was started by this script
-        self.daily_run_time_sec: float = 0.0  # Accumulated run time in seconds for today (script‑initiated runs)
-        self.cycles_today: int = 0  # Count of script‑initiated cycles completed today
+        self.running_since: Optional[datetime.datetime] = None  # Timestamp when the current run began
+        self.started_by_script: bool = False  # True if the current run was initiated by this blueprint
+        self.current_run_counts: bool = False  # True when the current run contributes to runtime/cycle counters
+        self.daily_run_time_sec: float = 0.0  # Accumulated run time in seconds for today (counted runs)
+        self.cycles_today: int = 0  # Count of cycles credited to today's targets
 
         # Hysteresis counters (seconds)
         self.on_counter_sec: float = 0.0  # Surplus positive duration
@@ -403,7 +404,7 @@ class PvAutostart:
 
         # Extended parameters
         if exclude_blueprint_turn_on_from_counters is not None:
-            self.exclude_blueprint_turn_on_from_counters = bool(
+            self.exclude_manual_starts_from_counters = bool(
                 exclude_blueprint_turn_on_from_counters
             )
         # Only update the turn off time if explicitly provided; this prevents
@@ -452,7 +453,16 @@ class PvAutostart:
             # If we didn't start the device but it's running, record start time
             if self.running_since is None:
                 self.running_since = now
-                # started_by_script remains False
+                self.started_by_script = False
+                if self.exclude_manual_starts_from_counters:
+                    self.current_run_counts = False
+                    log.debug(f"{self.log_prefix} manual start detected; counters excluded.")
+                else:
+                    self.current_run_counts = True
+                    self.cycles_today += 1
+                    log.debug(
+                        f"{self.log_prefix} manual start detected; counting towards targets (cycle {self.cycles_today})."
+                    )
 
             # Update counters
             # 1. No draw counter
@@ -486,26 +496,28 @@ class PvAutostart:
             # a) No draw condition
             if self.should_turn_off_for_no_draw():
                 # Only allow turning off for no draw after min cycles reached (handled in function)
-                log.info(f"{self.log_prefix} Turning off due to no draw; {debug_vals}")
+                log.debug(f"{self.log_prefix} turn-off reason=no_draw; {debug_vals}")
                 self._turn_device_off(now)
                 return
 
             # b) Import condition
             if self.should_turn_off_for_import(device_power, grid_import):
-                log.info(f"{self.log_prefix} Turning off due to grid import (interruptible); {debug_vals}, "
-                         f"device_power={device_power}, grid_import={grid_import}")
+                log.debug(
+                    f"{self.log_prefix} turn-off reason=grid_import; {debug_vals}, "
+                    f"device_power={device_power}, grid_import={grid_import}"
+                )
                 self._turn_device_off(now)
                 return
 
             # c) PV deficit / general condition
             if self.should_turn_off_for_pv_shortage():
-                log.info(f"{self.log_prefix} Turning off due to PV deficit; {debug_vals}")
+                log.debug(f"{self.log_prefix} turn-off reason=pv_deficit; {debug_vals}")
                 self._turn_device_off(now)
                 return
 
             # d) Scheduled turn off condition
             if self.should_turn_off_due_to_schedule(now):
-                log.info(f"{self.log_prefix} Turning off due to scheduled turn_off_time; {debug_vals}")
+                log.debug(f"{self.log_prefix} turn-off reason=scheduled_off; {debug_vals}")
                 self._turn_device_off(now)
                 return
 
@@ -538,13 +550,13 @@ class PvAutostart:
 
             # Check whether we can turn on due to PV surplus
             if self.can_turn_on_by_surplus():
-                log.info(f"{self.log_prefix} Turning on due to surplus; {debug_vals}")
+                log.debug(f"{self.log_prefix} turn-on reason=surplus; {debug_vals}")
                 self._turn_device_on(now)
                 return
 
             # If not turned on by surplus, check if we need to force run for targets
             if self.need_to_force_run_for_targets(now):
-                log.info(f"{self.log_prefix} Forcing start to meet targets; {debug_vals}")
+                log.debug(f"{self.log_prefix} turn-on reason=force_targets; {debug_vals}")
                 self._turn_device_on(now)
                 return
 
@@ -571,45 +583,32 @@ class PvAutostart:
         started by this script and increments the cycle counter.
         """
         if _turn_on(self.switch_entity):
-            # Mark the time when the device was started.  This is used for
-            # calculating the run duration when turning off later.  We set
-            # running_since regardless of the exclude flag because we still
-            # need to know how long the device has been running.
+            # Mark the time when the device was started so that run duration can be calculated on shut-down.
             self.running_since = now
-            # Only increment counters if not excluded.  When excluded, we do
-            # not count this run towards daily cycles or runtime.
-            if not self.exclude_blueprint_turn_on_from_counters:
-                self.started_by_script = True
-                self.cycles_today += 1
-            else:
-                self.started_by_script = False
-            # Reset the surplus counter so that subsequent on decisions require
-            # the configured buffer again.
+            self.started_by_script = True
+            self.current_run_counts = True
+            self.cycles_today += 1
+            # Reset the surplus counter so that subsequent on decisions require the configured buffer again.
             self.on_counter_sec = 0.0
-            log.info(
-                f"{self.log_prefix} Device switched ON"
-                + (
-                    f" (cycle {self.cycles_today})"
-                    if not self.exclude_blueprint_turn_on_from_counters
-                    else ""
-                )
-                + "."
-            )
+            log.info(f"{self.log_prefix} Device switched ON (cycle {self.cycles_today}).")
 
     def _turn_device_off(self, now: datetime.datetime) -> None:
         """
-        Turn the controlled device off and update run‑time tracking.  Only
-        script‑initiated runs contribute to the daily run time and cycle
-        counters.
+        Turn the controlled device off and update run-time tracking.  Only
+        runs marked to count (blueprint starts or manual starts when enabled)
+        contribute to the daily run time and cycle counters.
         """
         if _turn_off(self.switch_entity):
-            if self.started_by_script and self.running_since is not None:
+            if self.current_run_counts and self.running_since is not None:
                 run_duration_sec = (now - self.running_since).total_seconds()
                 self.daily_run_time_sec += run_duration_sec
-                log.info(f"{self.log_prefix} Added {run_duration_sec/60:.1f} minutes to daily run time "
-                         f"(total {self.daily_run_time_sec/60:.1f} min)")
+                log.debug(
+                    f"{self.log_prefix} credited {run_duration_sec/60:.1f} minutes; "
+                    f"total={self.daily_run_time_sec/60:.1f} min"
+                )
             self.running_since = None
             self.started_by_script = False
+            self.current_run_counts = False
             # Reset counters when turning off
             self.no_draw_counter_sec = 0.0
             self.import_off_counter_sec = 0.0
@@ -805,6 +804,7 @@ def reset_pv_autostart_counters():
             inst.cycles_today = 0
             inst.running_since = None
             inst.started_by_script = False
+            inst.current_run_counts = False
             inst.on_counter_sec = 0.0
             inst.no_draw_counter_sec = 0.0
             inst.import_off_counter_sec = 0.0
@@ -832,7 +832,7 @@ def pv_autostart(
     sensor_forecast_energy_today: Optional[str] = None,
     sensor_pv_power_now: Optional[str] = None,
     exclude_blueprint_turn_on_from_counters: Optional[bool] = None,
-    turn_off: Optional[Union[str, bool]] = None,
+    scheduled_turn_off_time: Optional[str] = None,
     force_turn_off_if_target_unreached: Optional[bool] = None,
 ) -> None:
     """
@@ -856,12 +856,9 @@ def pv_autostart(
     :param start_time_if_target_not_met: Fallback autostart time as string (HH:MM)
     :param sensor_forecast_energy_today: Sensor for remaining forecast PV energy in kWh
     :param sensor_pv_power_now: Sensor for current PV production in watts
-    :param exclude_blueprint_turn_on_from_counters: When true, runs initiated by this blueprint will not contribute
-        to the daily run‑time or cycle counters.  Default is False.
-    :param turn_off: Optional value controlling if and when the device should be turned off.  Accepts a boolean
-        or a time in the format ``HH:MM`` or ``HH:MM:SS``.  When a time is provided, the device will be turned off
-        at or after that time, subject to the daily runtime/cycle targets unless force_turn_off_if_target_unreached is
-        set.  If True is provided, midnight (00:00) is assumed.  Any other falsy value disables scheduled turn off.
+    :param exclude_blueprint_turn_on_from_counters: When true, manual starts will be ignored by the daily counters; blueprint starts always count. Default is False.
+    :param scheduled_turn_off_time: Optional time of day (``HH:MM``) after which the device should be switched off,
+        mirroring the fallback start behaviour.  Leave blank to disable the scheduled turn off.
     :param force_turn_off_if_target_unreached: When true, the device will be turned off at the scheduled turn off
         time even if the configured minimum runtime or cycle targets have not yet been met.  Default is False.
     """
@@ -869,7 +866,7 @@ def pv_autostart(
         f"{MODULE_PREFIX} pv_autostart service called with: "
         f"automation_id={automation_id}, switch={switch_entity}, pv={sensor_pv_power_now}, "
         f"import_sensors={sensor_grid_import_components}, buffers(on/off)={buffer_on_minutes}/{buffer_off_minutes} min, "
-        f"exclude_from_counters={exclude_blueprint_turn_on_from_counters}, turn_off={turn_off}, "
+        f"exclude_from_counters={exclude_blueprint_turn_on_from_counters}, scheduled_turn_off_time={scheduled_turn_off_time}, "
         f"force_turn_off_if_target_unreached={force_turn_off_if_target_unreached}"
     )
 
@@ -889,42 +886,26 @@ def pv_autostart(
     # Normalise extended booleans
     exclude_flag = bool(exclude_blueprint_turn_on_from_counters) if exclude_blueprint_turn_on_from_counters is not None else False
     force_turn_off_flag = bool(force_turn_off_if_target_unreached) if force_turn_off_if_target_unreached is not None else False
-    # Parse turn_off input.  Accepts booleans or strings representing HH:MM or HH:MM:SS.  When a
-    # boolean True is supplied, treat it as midnight (00:00).  Any value other than a valid time
-    # or True/False will disable scheduled turn off (i.e. None).
+    # Parse scheduled turn-off time (mirrors fallback start behaviour).  Accepts ``HH:MM`` or ``HH:MM:SS``.
     turn_off_time: Optional[datetime.time] = None
-    if turn_off is not None:
-        # If it's a boolean
-        if isinstance(turn_off, bool):
-            if turn_off:
-                # True means schedule at midnight
-                turn_off_time = datetime.time(0, 0)
-            else:
+    if scheduled_turn_off_time is not None:
+        s = str(scheduled_turn_off_time).strip()
+        if s:
+            try:
+                parts = s.split(':')
+                if len(parts) == 2:
+                    hour, minute = map(int, parts)
+                    turn_off_time = datetime.time(hour=hour, minute=minute)
+                elif len(parts) == 3:
+                    hour, minute, second = map(int, parts)
+                    turn_off_time = datetime.time(hour=hour, minute=minute, second=second)
+                else:
+                    raise ValueError
+            except Exception:
+                log.error(
+                    f"{MODULE_PREFIX} Invalid scheduled_turn_off_time: {scheduled_turn_off_time}; disabling scheduled turn off"
+                )
                 turn_off_time = None
-        else:
-            s = str(turn_off).strip()
-            # Accept the strings 'true' and 'false'
-            if s.lower() == 'true':
-                turn_off_time = datetime.time(0, 0)
-            elif s.lower() == 'false' or s == '':
-                turn_off_time = None
-            else:
-                # Attempt to parse as HH:MM or HH:MM:SS
-                try:
-                    parts = s.split(':')
-                    if len(parts) == 2:
-                        hour, minute = map(int, parts)
-                        turn_off_time = datetime.time(hour=hour, minute=minute)
-                    elif len(parts) == 3:
-                        hour, minute, second = map(int, parts)
-                        turn_off_time = datetime.time(hour=hour, minute=minute, second=second)
-                    else:
-                        raise ValueError
-                except Exception:
-                    log.error(
-                        f"{MODULE_PREFIX} Invalid turn_off value: {turn_off}; disabling scheduled turn off"
-                    )
-                    turn_off_time = None
     # Normalise automation id
     if automation_id is None:
         # Derive id from switch_entity if not provided

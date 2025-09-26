@@ -1,7 +1,8 @@
-➜  log ha core logs -f | grep wasserbett
-2025-09-26 01:24:08.426 INFO (MainThread) [homeassistant.components.automation.solarsteuerung_wasserbett_heizung] Initialized trigger Solarsteuerung Wasserbett Heizung
-2025-09-26 01:24:12.695 INFO (MainThread) [homeassistant.components.automation.solarsteuerung_wasserbett_heizung] Solarsteuerung Wasserbett Heizung: Running automation actions
-2025-09-26 01:24:12.695 INFO (MainThread) [homeassistant.components.automation.solarsteuerung_wasserbett_heizung] Solarsteuerung Wasserbett Heizung: Executing step call service
-2025-09-26 01:24:12.696 INFO (MainThread) [custom_components.pyscript.file.pv_autostart.pv_autostart] [pv_autostart] pv_autostart service called with: automation_id=automation.solarsteuerung_wasserbett_heizung, switch=switch.wasserbett_heizung, pv=sensor.power_production_now, import_sensors=['sensor.energy_netzbezug'], buffers(on/off)=3/5 min, exclude_from_counters=False, turn_off=False, force_turn_off_if_target_unreached=False
-2025-09-26 01:24:12.699 INFO (MainThread) [custom_components.pyscript.file.pv_autostart.pv_autostart] [pv_autostart] [switch.wasserbett_heizung automation.solarsteuerung_wasserbett_heizung] Registered instance; ticker every 30s
-2025-09-26 01:24:12.699 INFO (MainThread) [custom_components.pyscript.file.pv_autostart.pv_autostart] [pv_autostart] [switch.wasserbett_heizung automation.solarsteuerung_wasserbett_heizung] Created new PvAutostart instance.
+➜  ~ ha core logs -f | grep wasserbett
+2025-09-26 11:05:35.267 INFO (MainThread) [homeassistant.components.automation.solarsteuerung_wasserbett_heizung] Initialized trigger Solarsteuerung Wasserbett Heizung
+2025-09-26 11:06:20.558 INFO (MainThread) [homeassistant.components.automation.solarsteuerung_wasserbett_heizung] Initialized trigger Solarsteuerung Wasserbett Heizung
+2025-09-26 11:06:28.674 INFO (MainThread) [homeassistant.components.automation.solarsteuerung_wasserbett_heizung] Solarsteuerung Wasserbett Heizung: Running automation actions
+2025-09-26 11:06:28.675 INFO (MainThread) [homeassistant.components.automation.solarsteuerung_wasserbett_heizung] Solarsteuerung Wasserbett Heizung: Executing step call service
+2025-09-26 11:06:28.675 INFO (MainThread) [custom_components.pyscript.file.pv_autostart.pv_autostart] [pv_autostart] pv_autostart service called with: automation_id=automation.solarsteuerung_wasserbett_heizung, switch=switch.wasserbett_heizung, pv=sensor.power_production_now, import_sensors=['sensor.energy_netzbezug'], buffers(on/off)=3/5 min, exclude_from_counters=False, scheduled_turn_off_time=03:00:00, force_turn_off_if_target_unreached=False
+2025-09-26 11:06:28.678 INFO (MainThread) [custom_components.pyscript.file.pv_autostart.pv_autostart] [pv_autostart] [switch.wasserbett_heizung automation.solarsteuerung_wasserbett_heizung] Registered instance; ticker every 30s
+2025-09-26 11:06:28.679 INFO (MainThread) [custom_components.pyscript.file.pv_autostart.pv_autostart] [pv_autostart] [switch.wasserbett_heizung automation.solarsteuerung_wasserbett_heizung] Created new PvAutostart instance.
