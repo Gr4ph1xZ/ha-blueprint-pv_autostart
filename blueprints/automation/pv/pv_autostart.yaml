@@ -171,6 +171,39 @@ blueprint:
           domain: sensor
           multiple: false
 
+    exclude_blueprint_turn_on_from_counters:
+      name: Exclude blueprint turn on from counters
+      description: >
+        (Optional) When enabled, any runs initiated by this blueprint will not count towards the daily
+        run time or cycle counters.  Use this when you want to manually control which runs contribute
+        to your targets.  Default is false.
+      default: false
+      selector:
+        boolean: {}
+
+    turn_off:
+      name: Scheduled turn off
+      description: >
+        (Optional) Define when the device should be turned off.  Accepts a boolean, a time (``HH:MM`` or
+        ``HH:MM:SS``), or a template.  When set to true, the device will be turned off at midnight.  When set
+        to a specific time, the device will be turned off at or after that time of day, subject to the
+        configured minimum runtime or cycle targets unless 'force turn off if target unmet' is enabled.
+        Leave blank or set to false to disable scheduled turn off.  Default is false.
+      default: false
+      selector:
+        text:
+          multiline: false
+
+    force_turn_off_if_target_unreached:
+      name: Force turn off even if target unmet
+      description: >
+        (Optional) When enabled, the device will be turned off at the scheduled time even if the configured
+        minimum daily runtime or cycle targets have not yet been met.  When disabled, the device will
+        continue running until the targets are reached.  Default is false.
+      default: false
+      selector:
+        boolean: {}
+
 mode: restart
 trigger:
   - platform: homeassistant
@@ -194,3 +227,6 @@ action:
       start_time_if_target_not_met: !input start_time_if_target_not_met
       sensor_forecast_energy_today: !input sensor_forecast_energy_today
       sensor_pv_power_now: !input sensor_pv_power_now
+      exclude_blueprint_turn_on_from_counters: !input exclude_blueprint_turn_on_from_counters
+      turn_off: !input turn_off
+      force_turn_off_if_target_unreached: !input force_turn_off_if_target_unreached

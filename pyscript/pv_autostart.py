@@ -44,9 +44,16 @@ running concurrently.  Comments and logging are written in English.
 
 """
 
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, Tuple
 import datetime
-log.info("pv_autostart module loaded: registering service and waiting for first call")
+
+# Prefix used for all log messages originating from this module.  Using a
+# constant prefix makes it easy to filter and search for messages related to
+# this blueprint.  The prefix is prepended to the per‑instance log prefix
+# defined on each PvAutostart instance.
+MODULE_PREFIX = "[pv_autostart]"
+
+log.info(f"{MODULE_PREFIX} module loaded: registering service and waiting for first call")
 
 
 
@@ -66,7 +73,7 @@ def _get_state(entity_id: str) -> Optional[str]:
     try:
         entity_state = state.get(entity_id)
     except Exception as e:
-        log.error(f"Could not get state from entity {entity_id}: {e}")
+        log.error(f"{MODULE_PREFIX} Could not get state from entity {entity_id}: {e}")
         return None
     if domain == 'climate':
         if isinstance(entity_state, str) and entity_state.lower() in ['heat', 'cool', 'boost', 'on']:
@@ -74,7 +81,7 @@ def _get_state(entity_id: str) -> Optional[str]:
         elif entity_state == 'off':
             return 'off'
         else:
-            log.error(f"Entity state not supported for climate domain: {entity_state}")
+            log.error(f"{MODULE_PREFIX} Entity state not supported for climate domain: {entity_state}")
             return None
     return entity_state
 
@@ -94,11 +101,11 @@ def _validate_number(num: Union[str, float, int], return_on_error: Optional[floa
     try:
         f = float(num)
     except Exception as e:
-        log.error(f"{num=} is not a valid number: {e}")
+        log.error(f"{MODULE_PREFIX} {num=} is not a valid number: {e}")
         return return_on_error
     if -1000000 <= f <= 1000000:
         return f
-    log.error(f"{f} is outside the valid range [-1000000, 1000000]")
+    log.error(f"{MODULE_PREFIX} {f} is outside the valid range [-1000000, 1000000]")
     return return_on_error
 
 
@@ -125,12 +132,12 @@ def _turn_on(entity_id: str) -> bool:
     """
     domain = entity_id.split('.')[0]
     if not service.has_service(domain, 'turn_on'):
-        log.error(f"Cannot switch on {entity_id}: service '{domain}.turn_on' does not exist.")
+        log.error(f"{MODULE_PREFIX} Cannot switch on {entity_id}: service '{domain}.turn_on' does not exist.")
         return False
     try:
         service.call(domain, 'turn_on', entity_id=entity_id)
     except Exception as e:
-        log.error(f"Cannot switch on {entity_id}: {e}")
+        log.error(f"{MODULE_PREFIX} Cannot switch on {entity_id}: {e}")
         return False
     return True
 
@@ -146,12 +153,12 @@ def _turn_off(entity_id: str) -> bool:
     """
     domain = entity_id.split('.')[0]
     if not service.has_service(domain, 'turn_off'):
-        log.error(f"Cannot switch off {entity_id}: service '{domain}.turn_off' does not exist.")
+        log.error(f"{MODULE_PREFIX} Cannot switch off {entity_id}: service '{domain}.turn_off' does not exist.")
         return False
     try:
         service.call(domain, 'turn_off', entity_id=entity_id)
     except Exception as e:
-        log.error(f"Cannot switch off {entity_id}: {e}")
+        log.error(f"{MODULE_PREFIX} Cannot switch off {entity_id}: {e}")
         return False
     return True
 
@@ -237,13 +244,19 @@ class PvAutostart:
         start_time_if_target_not_met: datetime.time,
         sensor_forecast_energy_today: Optional[str],
         sensor_pv_power_now: str,
+        exclude_blueprint_turn_on_from_counters: bool = False,
+        turn_off_time: Optional[datetime.time] = None,
+        force_turn_off_if_target_unreached: bool = False,
     ):
         self._hb = 0  # heartbeat counter
 
         # Basic identifiers
         self.automation_id: str = automation_id
         self.switch_entity: str = switch_entity
-        self.log_prefix: str = f"[{self.switch_entity} {self.automation_id}]"
+        # Prepend the module prefix to each instance specific prefix.  This makes
+        # it easy to grep for messages related to this blueprint while still
+        # retaining context about the switch and automation id.
+        self.log_prefix: str = f"{MODULE_PREFIX} [{self.switch_entity} {self.automation_id}]"
 
         # Configuration parameters
         self.sensor_device_power: Optional[str] = sensor_device_power or None
@@ -270,6 +283,27 @@ class PvAutostart:
         self.start_time_if_target_not_met: datetime.time = start_time_if_target_not_met
         self.sensor_forecast_energy_today: Optional[str] = sensor_forecast_energy_today or None
         self.sensor_pv_power_now: str = sensor_pv_power_now
+
+        # Extended configuration
+        # When true, script‑initiated runs will not increment the cycle or
+        # run‑time counters.  This allows the user to exclude certain runs
+        # from the daily targets.  Default is False to preserve previous
+        # behaviour.
+        self.exclude_blueprint_turn_on_from_counters: bool = bool(
+            exclude_blueprint_turn_on_from_counters
+        )
+        # Optional time of day after which the device should be turned off.
+        # If None, no scheduled turn off will occur.  If provided as a
+        # datetime.time, the device will attempt to turn off at or after
+        # this time, subject to the minimum runtime/cycle targets unless
+        # force_turn_off_if_target_unreached is true.
+        self.turn_off_time: Optional[datetime.time] = turn_off_time
+        # If true, the device will be turned off at the scheduled turn off
+        # time even if the configured daily runtime or cycle targets have
+        # not yet been met.  Defaults to False to preserve prior logic.
+        self.force_turn_off_if_target_unreached: bool = bool(
+            force_turn_off_if_target_unreached
+        )
 
         # Runtime state variables
         self.running_since: Optional[datetime.datetime] = None  # When the device was last started by this script
@@ -327,6 +361,9 @@ class PvAutostart:
         start_time_if_target_not_met: datetime.time,
         sensor_forecast_energy_today: Optional[str],
         sensor_pv_power_now: str,
+        exclude_blueprint_turn_on_from_counters: Optional[bool] = None,
+        turn_off_time: Optional[datetime.time] = None,
+        force_turn_off_if_target_unreached: Optional[bool] = None,
     ) -> None:
         """
         Update the configuration parameters of this instance.  This allows
@@ -363,6 +400,20 @@ class PvAutostart:
         self.start_time_if_target_not_met = start_time_if_target_not_met
         self.sensor_forecast_energy_today = sensor_forecast_energy_today or None
         self.sensor_pv_power_now = sensor_pv_power_now
+
+        # Extended parameters
+        if exclude_blueprint_turn_on_from_counters is not None:
+            self.exclude_blueprint_turn_on_from_counters = bool(
+                exclude_blueprint_turn_on_from_counters
+            )
+        # Only update the turn off time if explicitly provided; this prevents
+        # overwriting an existing time with None when a parameter is omitted.
+        if turn_off_time is not None:
+            self.turn_off_time = turn_off_time
+        if force_turn_off_if_target_unreached is not None:
+            self.force_turn_off_if_target_unreached = bool(
+                force_turn_off_if_target_unreached
+            )
 
     # ----------------------------------------------------------------------
     # Core logic
@@ -452,14 +503,23 @@ class PvAutostart:
                 self._turn_device_off(now)
                 return
 
+            # d) Scheduled turn off condition
+            if self.should_turn_off_due_to_schedule(now):
+                log.info(f"{self.log_prefix} Turning off due to scheduled turn_off_time; {debug_vals}")
+                self._turn_device_off(now)
+                return
+
             # Otherwise keep running
-            log.debug(f"{self.log_prefix} Device ON; counters: no_draw={self.no_draw_counter_sec}s, "
-                      f"import_off={self.import_off_counter_sec}s, pv_deficit={self.pv_deficit_counter_sec}s; "
-                      f"{debug_vals}")
+            log.debug(
+                f"{self.log_prefix} Device ON; counters: no_draw={self.no_draw_counter_sec}s, "
+                f"import_off={self.import_off_counter_sec}s, pv_deficit={self.pv_deficit_counter_sec}s; "
+                f"{debug_vals}"
+            )
             self._hb += 1
             if self._hb % 10 == 0:  # alle 10 Ticks (= ~5 min bei 30s-Intervall)
                 log.debug(
-                    f"{self.log_prefix} heartbeat: runtime={self.daily_run_time_sec / 60:.1f} min, cycles={self.cycles_today}")
+                    f"{self.log_prefix} heartbeat: runtime={self.daily_run_time_sec / 60:.1f} min, cycles={self.cycles_today}"
+                )
 
             return
 
@@ -511,11 +571,30 @@ class PvAutostart:
         started by this script and increments the cycle counter.
         """
         if _turn_on(self.switch_entity):
+            # Mark the time when the device was started.  This is used for
+            # calculating the run duration when turning off later.  We set
+            # running_since regardless of the exclude flag because we still
+            # need to know how long the device has been running.
             self.running_since = now
-            self.started_by_script = True
-            self.cycles_today += 1
+            # Only increment counters if not excluded.  When excluded, we do
+            # not count this run towards daily cycles or runtime.
+            if not self.exclude_blueprint_turn_on_from_counters:
+                self.started_by_script = True
+                self.cycles_today += 1
+            else:
+                self.started_by_script = False
+            # Reset the surplus counter so that subsequent on decisions require
+            # the configured buffer again.
             self.on_counter_sec = 0.0
-            log.info(f"{self.log_prefix} Device switched ON (cycle {self.cycles_today}).")
+            log.info(
+                f"{self.log_prefix} Device switched ON"
+                + (
+                    f" (cycle {self.cycles_today})"
+                    if not self.exclude_blueprint_turn_on_from_counters
+                    else ""
+                )
+                + "."
+            )
 
     def _turn_device_off(self, now: datetime.datetime) -> None:
         """
@@ -606,6 +685,45 @@ class PvAutostart:
         required_sec = self.buffer_off_minutes * 60.0
         return self.pv_deficit_counter_sec >= required_sec
 
+    def should_turn_off_due_to_schedule(self, now: datetime.datetime) -> bool:
+        """
+        Determine whether the device should be switched off because the
+        configured turn_off_time has been reached.  When a turn‑off time
+        is defined, the device will be turned off at or after that time if
+        either (1) the daily runtime and cycle targets have been met or
+        (2) the force_turn_off_if_target_unreached flag is True.  If no
+        turn_off_time is defined, this method always returns False.
+
+        :param now: Current datetime
+        :return: True if the device should be turned off according to schedule
+        """
+        if self.turn_off_time is None:
+            return False
+        # Construct today's datetime at the scheduled off time.  If the off
+        # time is earlier than now's time and we crossed midnight, we still
+        # combine with today's date; the off condition will become true on
+        # the next midnight tick.  This keeps behaviour consistent across
+        # days.
+        try:
+            off_dt = datetime.datetime.combine(now.date(), self.turn_off_time)
+        except Exception:
+            # If time construction fails, do not schedule off
+            return False
+        if now < off_dt:
+            return False
+        # At or after the scheduled turn off time.  If targets are unmet and
+        # the force flag is not set, we defer the off.
+        if not self.force_turn_off_if_target_unreached:
+            # Check runtime target
+            if self.min_runtime_per_day_minutes is not None:
+                if (self.daily_run_time_sec / 60.0) < self.min_runtime_per_day_minutes:
+                    return False
+            # Check cycle target
+            if self.min_cycles_per_day is not None:
+                if self.cycles_today < self.min_cycles_per_day:
+                    return False
+        return True
+
     def need_to_force_run_for_targets(self, now: datetime.datetime) -> bool:
         """
         Evaluate whether to force start the device in order to achieve the
@@ -679,7 +797,7 @@ def reset_pv_autostart_counters():
     cleared.  This function runs once per day and ensures that each
     automation starts with a clean slate.
     """
-    log.info("Resetting PvAutostart counters for all instances at midnight.")
+    log.info(f"{MODULE_PREFIX} Resetting PvAutostart counters for all instances at midnight.")
     for entry in list(PvAutostart.instances.values()):
         inst: PvAutostart = entry.get('instance')
         if inst:
@@ -713,6 +831,9 @@ def pv_autostart(
     start_time_if_target_not_met: Optional[str] = None,
     sensor_forecast_energy_today: Optional[str] = None,
     sensor_pv_power_now: Optional[str] = None,
+    exclude_blueprint_turn_on_from_counters: Optional[bool] = None,
+    turn_off: Optional[Union[str, bool]] = None,
+    force_turn_off_if_target_unreached: Optional[bool] = None,
 ) -> None:
     """
     Register or update a PV autostart automation.  When invoked from the
@@ -735,25 +856,75 @@ def pv_autostart(
     :param start_time_if_target_not_met: Fallback autostart time as string (HH:MM)
     :param sensor_forecast_energy_today: Sensor for remaining forecast PV energy in kWh
     :param sensor_pv_power_now: Sensor for current PV production in watts
+    :param exclude_blueprint_turn_on_from_counters: When true, runs initiated by this blueprint will not contribute
+        to the daily run‑time or cycle counters.  Default is False.
+    :param turn_off: Optional value controlling if and when the device should be turned off.  Accepts a boolean
+        or a time in the format ``HH:MM`` or ``HH:MM:SS``.  When a time is provided, the device will be turned off
+        at or after that time, subject to the daily runtime/cycle targets unless force_turn_off_if_target_unreached is
+        set.  If True is provided, midnight (00:00) is assumed.  Any other falsy value disables scheduled turn off.
+    :param force_turn_off_if_target_unreached: When true, the device will be turned off at the scheduled turn off
+        time even if the configured minimum runtime or cycle targets have not yet been met.  Default is False.
     """
     log.info(
-        "pv_autostart service called with: "
+        f"{MODULE_PREFIX} pv_autostart service called with: "
         f"automation_id={automation_id}, switch={switch_entity}, pv={sensor_pv_power_now}, "
-        f"import_sensors={sensor_grid_import_components}, buffers(on/off)={buffer_on_minutes}/{buffer_off_minutes} min"
+        f"import_sensors={sensor_grid_import_components}, buffers(on/off)={buffer_on_minutes}/{buffer_off_minutes} min, "
+        f"exclude_from_counters={exclude_blueprint_turn_on_from_counters}, turn_off={turn_off}, "
+        f"force_turn_off_if_target_unreached={force_turn_off_if_target_unreached}"
     )
 
     # Basic validation and normalisation of inputs
     if switch_entity is None:
-        log.error("pv_autostart service call missing required parameter 'switch_entity'")
+        log.error(f"{MODULE_PREFIX} pv_autostart service call missing required parameter 'switch_entity'")
         return
     if no_draw_threshold_watts is None:
-        log.error("pv_autostart service call missing required parameter 'no_draw_threshold_watts'")
+        log.error(f"{MODULE_PREFIX} pv_autostart service call missing required parameter 'no_draw_threshold_watts'")
         return
     if buffer_on_minutes is None or buffer_off_minutes is None:
-        log.error("pv_autostart service call missing required buffer_on_minutes or buffer_off_minutes")
+        log.error(f"{MODULE_PREFIX} pv_autostart service call missing required buffer_on_minutes or buffer_off_minutes")
         return
     if interruptible is None:
         interruptible = False
+
+    # Normalise extended booleans
+    exclude_flag = bool(exclude_blueprint_turn_on_from_counters) if exclude_blueprint_turn_on_from_counters is not None else False
+    force_turn_off_flag = bool(force_turn_off_if_target_unreached) if force_turn_off_if_target_unreached is not None else False
+    # Parse turn_off input.  Accepts booleans or strings representing HH:MM or HH:MM:SS.  When a
+    # boolean True is supplied, treat it as midnight (00:00).  Any value other than a valid time
+    # or True/False will disable scheduled turn off (i.e. None).
+    turn_off_time: Optional[datetime.time] = None
+    if turn_off is not None:
+        # If it's a boolean
+        if isinstance(turn_off, bool):
+            if turn_off:
+                # True means schedule at midnight
+                turn_off_time = datetime.time(0, 0)
+            else:
+                turn_off_time = None
+        else:
+            s = str(turn_off).strip()
+            # Accept the strings 'true' and 'false'
+            if s.lower() == 'true':
+                turn_off_time = datetime.time(0, 0)
+            elif s.lower() == 'false' or s == '':
+                turn_off_time = None
+            else:
+                # Attempt to parse as HH:MM or HH:MM:SS
+                try:
+                    parts = s.split(':')
+                    if len(parts) == 2:
+                        hour, minute = map(int, parts)
+                        turn_off_time = datetime.time(hour=hour, minute=minute)
+                    elif len(parts) == 3:
+                        hour, minute, second = map(int, parts)
+                        turn_off_time = datetime.time(hour=hour, minute=minute, second=second)
+                    else:
+                        raise ValueError
+                except Exception:
+                    log.error(
+                        f"{MODULE_PREFIX} Invalid turn_off value: {turn_off}; disabling scheduled turn off"
+                    )
+                    turn_off_time = None
     # Normalise automation id
     if automation_id is None:
         # Derive id from switch_entity if not provided
@@ -774,7 +945,7 @@ def pv_autostart(
             else:
                 raise ValueError
         except Exception:
-            log.error(f"Invalid start_time_if_target_not_met: {start_time_if_target_not_met}, falling back to 00:00")
+            log.error(f"{MODULE_PREFIX} Invalid start_time_if_target_not_met: {start_time_if_target_not_met}, falling back to 00:00")
             start_time = datetime.time(0, 0)
     else:
         # Default to midnight if not supplied
@@ -786,7 +957,9 @@ def pv_autostart(
     if automation_id not in PvAutostart.instances:
         # Ensure sensor_pv_power_now exists
         if not sensor_pv_power_now:
-            log.error("pv_autostart service call missing required parameter 'sensor_pv_power_now'")
+            log.error(
+                f"{MODULE_PREFIX} pv_autostart service call missing required parameter 'sensor_pv_power_now'"
+            )
             return
         inst = PvAutostart(
             automation_id=automation_id,
@@ -803,9 +976,12 @@ def pv_autostart(
             start_time_if_target_not_met=start_time,
             sensor_forecast_energy_today=sensor_forecast_energy_today,
             sensor_pv_power_now=sensor_pv_power_now,
+            exclude_blueprint_turn_on_from_counters=exclude_flag,
+            turn_off_time=turn_off_time,
+            force_turn_off_if_target_unreached=force_turn_off_flag,
         )
         PvAutostart.instances[automation_id] = {'instance': inst}
-        log.info(f"[{switch_entity} {automation_id}] Created new PvAutostart instance.")
+        log.info(f"{MODULE_PREFIX} [{switch_entity} {automation_id}] Created new PvAutostart instance.")
     else:
         inst: PvAutostart = PvAutostart.instances[automation_id]['instance']
         inst.update_params(
@@ -822,14 +998,17 @@ def pv_autostart(
             start_time_if_target_not_met=start_time,
             sensor_forecast_energy_today=sensor_forecast_energy_today,
             sensor_pv_power_now=sensor_pv_power_now,
+            exclude_blueprint_turn_on_from_counters=exclude_flag,
+            turn_off_time=turn_off_time,
+            force_turn_off_if_target_unreached=force_turn_off_flag,
         )
-        log.info(f"[{switch_entity} {automation_id}] Updated existing PvAutostart instance.")
+        log.info(f"{MODULE_PREFIX} [{switch_entity} {automation_id}] Updated existing PvAutostart instance.")
 
 @service
 def pv_autostart_dump(automation_id: str):
     entry = PvAutostart.instances.get(automation_id)
     if not entry:
-        log.warning(f"[{automation_id}] dump: no instance found")
+        log.warning(f"{MODULE_PREFIX} [{automation_id}] dump: no instance found")
         return
     inst = entry["instance"]
     pv = _get_num_state(inst.sensor_pv_power_now, 0) or 0.0
