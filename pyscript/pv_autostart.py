@@ -314,6 +314,13 @@ class PvAutostart:
         self.current_run_counts: bool = False  # True when the current run contributes to runtime/cycle counters
         self.daily_run_time_sec: float = 0.0  # Accumulated run time in seconds for today (counted runs)
         self.cycles_today: int = 0  # Count of cycles credited to today's targets
+        self.cycle_count_min_duration_sec: float = (
+            float(self.off_after_minutes_without_draw) * 60.0
+            if self.off_after_minutes_without_draw is not None
+            else 0.0
+        )
+        self.last_start_reason: Optional[str] = None
+        self.forced_run_active: bool = False
         self.estimated_device_power_watts: Optional[float] = None  # Last observed meaningful device power reading
 
         # Hysteresis counters (seconds)
@@ -383,6 +390,11 @@ class PvAutostart:
         self.start_time_if_target_not_met = start_time_if_target_not_met
         self.sensor_forecast_energy_today = sensor_forecast_energy_today or None
         self.sensor_pv_power_now = sensor_pv_power_now
+        self.cycle_count_min_duration_sec = (
+            float(self.off_after_minutes_without_draw) * 60.0
+            if self.off_after_minutes_without_draw is not None
+            else 0.0
+        )
 
 
         # Extended parameters
@@ -450,10 +462,9 @@ class PvAutostart:
                     log.debug(f"{self.log_prefix} manual start detected; counters excluded.")
                 else:
                     self.current_run_counts = True
-                    self.cycles_today += 1
-                    log.debug(
-                        f"{self.log_prefix} manual start detected; counting towards targets (cycle {self.cycles_today})."
-                    )
+                    log.debug(f"{self.log_prefix} manual start detected; counting towards targets.")
+                self.last_start_reason = 'manual'
+                self.forced_run_active = False
 
             if device_power is not None and device_power > self.no_draw_threshold_watts:
                 self.estimated_device_power_watts = device_power
@@ -491,31 +502,34 @@ class PvAutostart:
 
             # Evaluate off conditions in order of priority
             # a) No draw condition
-            if self.should_turn_off_for_no_draw():
-                # Only allow turning off for no draw after min cycles reached (handled in function)
-                log.debug(f"{self.log_prefix} turn-off reason=no_draw; {debug_vals}")
-                self._turn_device_off(now)
-                return
+            if self.should_turn_off_for_no_draw(now):
+                if self.can_end_forced_run(now, 'no_draw'):
+                    log.debug(f"{self.log_prefix} turn-off reason=no_draw; {debug_vals}")
+                    self._turn_device_off(now, 'no_draw')
+                    return
+                log.debug(f"{self.log_prefix} no_draw condition met but forced run guard active; keeping device ON.")
 
             # b) Import condition
             if self.should_turn_off_for_import(device_power, grid_import):
-                log.debug(
-                    f"{self.log_prefix} turn-off reason=grid_import; {debug_vals}, "
-                    f"device_power={device_power}, grid_import={grid_import}"
-                )
-                self._turn_device_off(now)
-                return
+                if self.can_end_forced_run(now, 'grid_import'):
+                    log.debug(
+                        f"{self.log_prefix} turn-off reason=grid_import; {debug_vals}, "
+                        f"device_power={device_power}, grid_import={grid_import}"
+                    )
+                    self._turn_device_off(now, 'grid_import')
+                    return
+                log.debug(f"{self.log_prefix} grid_import condition met but forced run guard active; keeping device ON.")
 
-            # c) PV deficit / general condition
-            if self.should_turn_off_for_pv_shortage():
+            # c) PV deficit / general condition (disabled while forced run is active)
+            if (not self.forced_run_active) and self.should_turn_off_for_pv_shortage():
                 log.debug(f"{self.log_prefix} turn-off reason=pv_deficit; {debug_vals}")
-                self._turn_device_off(now)
+                self._turn_device_off(now, 'pv_deficit')
                 return
 
             # d) Scheduled turn off condition
             if self.should_turn_off_due_to_schedule(now):
                 log.debug(f"{self.log_prefix} turn-off reason=scheduled_off; {debug_vals}")
-                self._turn_device_off(now)
+                self._turn_device_off(now, 'scheduled_off')
                 return
 
             # Otherwise keep running
@@ -552,13 +566,14 @@ class PvAutostart:
             # Check whether we can turn on due to PV surplus
             if self.can_turn_on_by_surplus():
                 log.debug(f"{self.log_prefix} turn-on reason=surplus; {debug_vals}")
-                self._turn_device_on(now)
+                self._turn_device_on(now, 'surplus')
                 return
 
             # If not turned on by surplus, check if we need to force run for targets
-            if self.need_to_force_run_for_targets(now):
-                log.debug(f"{self.log_prefix} turn-on reason=force_targets; {debug_vals}")
-                self._turn_device_on(now)
+            force_reason = self.need_to_force_run_for_targets(now)
+            if force_reason:
+                log.debug(f"{self.log_prefix} turn-on reason={force_reason}; {debug_vals}")
+                self._turn_device_on(now, force_reason)
                 return
 
             # Otherwise remain off
@@ -577,32 +592,46 @@ class PvAutostart:
     # ----------------------------------------------------------------------
     # Device control helpers
     # ----------------------------------------------------------------------
-    def _turn_device_on(self, now: datetime.datetime) -> None:
+    def _turn_device_on(self, now: datetime.datetime, reason: str) -> None:
         """
-        Turn the controlled device on and update run‑time tracking.  If the
+        Turn the controlled device on and update run-time tracking.  If the
         service call is successful the script marks that the device was
-        started by this script and increments the cycle counter.
+        started by this script and primes the counters for run tracking.
         """
         if _turn_on(self.switch_entity):
             # Mark the time when the device was started so that run duration can be calculated on shut-down.
             self.running_since = now
             self.started_by_script = True
             self.current_run_counts = True
-            self.cycles_today += 1
             # Reset the surplus counter so that subsequent on decisions require the configured buffer again.
             self.on_counter_sec = 0.0
-            log.info(f"{self.log_prefix} Device switched ON (cycle {self.cycles_today}).")
+            self.last_start_reason = reason
+            self.forced_run_active = reason in {
+                'force_no_forecast',
+                'force_required_energy',
+                'force_fallback_targets',
+                'force_fallback'
+            }
+            info_reason = reason.replace('_', ' ')
+            log.info(f"{self.log_prefix} Device switched ON; reason={info_reason}.")
 
-    def _turn_device_off(self, now: datetime.datetime) -> None:
+    def _turn_device_off(self, now: datetime.datetime, reason: str) -> None:
         """
         Turn the controlled device off and update run-time tracking.  Only
         runs marked to count (blueprint starts or manual starts when enabled)
         contribute to the daily run time and cycle counters.
         """
         if _turn_off(self.switch_entity):
+            counted_cycle = False
             if self.current_run_counts and self.running_since is not None:
                 run_duration_sec = (now - self.running_since).total_seconds()
                 self.daily_run_time_sec += run_duration_sec
+                if (
+                    self.cycle_count_min_duration_sec <= 0.0
+                    or run_duration_sec >= self.cycle_count_min_duration_sec
+                ):
+                    self.cycles_today += 1
+                    counted_cycle = True
                 log.debug(
                     f"{self.log_prefix} credited {run_duration_sec/60:.1f} minutes; "
                     f"total={self.daily_run_time_sec/60:.1f} min"
@@ -610,12 +639,17 @@ class PvAutostart:
             self.running_since = None
             self.started_by_script = False
             self.current_run_counts = False
+            self.last_start_reason = None
+            self.forced_run_active = False
             # Reset counters when turning off
             self.no_draw_counter_sec = 0.0
             self.import_off_counter_sec = 0.0
             self.pv_deficit_counter_sec = 0.0
             self.on_counter_sec = 0.0
-            log.info(f"{self.log_prefix} Device switched OFF.")
+            info_reason = reason.replace('_', ' ')
+            log.info(
+                f"{self.log_prefix} Device switched OFF; reason={info_reason}; counted_cycle={counted_cycle}."
+            )
 
 
 
@@ -631,7 +665,7 @@ class PvAutostart:
         required_sec = self.buffer_on_minutes * 60.0
         return self.on_counter_sec >= required_sec and self.buffer_on_minutes > 0
 
-    def should_turn_off_for_no_draw(self) -> bool:
+    def should_turn_off_for_no_draw(self, now: datetime.datetime) -> bool:
         """
         Check if the device should be switched off because it is drawing no
         power for an extended period.  This condition is only evaluated if
@@ -641,9 +675,9 @@ class PvAutostart:
         """
         if self.sensor_device_power is None or self.off_after_minutes_without_draw is None:
             return False
-        # If a cycle target is defined and not yet met, do not turn off
-        if self.min_cycles_per_day is not None and self.cycles_today < self.min_cycles_per_day:
-            return False
+        if self.min_cycles_per_day is not None:
+            if self._projected_cycle_count(now) < self.min_cycles_per_day:
+                return False
         required_sec = self.off_after_minutes_without_draw * 60.0
         return self.no_draw_counter_sec >= required_sec
 
@@ -690,7 +724,7 @@ class PvAutostart:
     def should_turn_off_due_to_schedule(self, now: datetime.datetime) -> bool:
         """
         Determine whether the device should be switched off because the
-        configured turn_off_time has been reached.  When a turn‑off time
+        configured turn_off_time has been reached.  When a turn-off time
         is defined, the device will be turned off at or after that time if
         either (1) the daily runtime and cycle targets have been met or
         (2) the force_turn_off_if_target_unreached flag is True.  If no
@@ -726,8 +760,50 @@ class PvAutostart:
                     return False
         return True
 
-    def need_to_force_run_for_targets(self, now: datetime.datetime) -> bool:
-        """Determine whether the device should be started to fulfil daily targets."""
+    def _current_run_duration_seconds(self, now: datetime.datetime) -> float:
+        if self.running_since is None:
+            return 0.0
+        return max(0.0, (now - self.running_since).total_seconds())
+
+    def _total_runtime_minutes_including_current(self, now: datetime.datetime) -> float:
+        runtime_sec = self.daily_run_time_sec
+        if self.current_run_counts:
+            runtime_sec += self._current_run_duration_seconds(now)
+        return runtime_sec / 60.0
+
+    def _projected_cycle_count(self, now: datetime.datetime) -> int:
+        cycles = self.cycles_today
+        if not self.current_run_counts:
+            return cycles
+        if self.cycle_count_min_duration_sec <= 0.0:
+            return cycles + 1
+        if self._current_run_duration_seconds(now) >= self.cycle_count_min_duration_sec:
+            return cycles + 1
+        return cycles
+
+    def forced_run_targets_met(self, now: datetime.datetime) -> bool:
+        if self.min_runtime_per_day_minutes is None and self.min_cycles_per_day is None:
+            return True
+        runtime_met = True
+        if self.min_runtime_per_day_minutes is not None:
+            runtime_met = (
+                self._total_runtime_minutes_including_current(now)
+                >= self.min_runtime_per_day_minutes
+            )
+        cycles_met = True
+        if self.min_cycles_per_day is not None:
+            cycles_met = self._projected_cycle_count(now) >= self.min_cycles_per_day
+        return runtime_met or cycles_met
+
+    def can_end_forced_run(self, now: datetime.datetime, reason: str) -> bool:
+        if not self.forced_run_active:
+            return True
+        if reason == 'scheduled_off':
+            return True
+        return self.forced_run_targets_met(now)
+
+    def need_to_force_run_for_targets(self, now: datetime.datetime) -> Optional[str]:
+        """Return a reason string when a forced start is required, otherwise None."""
         forecast_kwh: Optional[float] = None
         if self.sensor_forecast_energy_today:
             forecast_kwh = _get_num_state(self.sensor_forecast_energy_today, return_on_error=None)
@@ -772,7 +848,7 @@ class PvAutostart:
                 log.debug(
                     f"{self.log_prefix} Forecast {forecast_kwh:.2f} kWh covers runtime need {energy_needed_kwh:.2f} kWh; waiting."
                 )
-                return False
+                return None
 
             try:
                 start_datetime = datetime.datetime.combine(now.date(), self.start_time_if_target_not_met)
@@ -781,10 +857,10 @@ class PvAutostart:
 
             if now >= start_datetime:
                 log.debug(f"{self.log_prefix} Fallback start time reached with targets unmet; forcing start.")
-                return True
+                return 'force_fallback_targets'
 
             log.debug(f"{self.log_prefix} Targets unmet but fallback time not reached; deferring force start.")
-            return False
+            return None
 
         if self.required_daily_energy_kwh is not None:
             if forecast_kwh is None:
@@ -795,16 +871,16 @@ class PvAutostart:
                 log.debug(
                     f"{self.log_prefix} Forecast {forecast_kwh:.2f} kWh below required daily energy {self.required_daily_energy_kwh:.2f} kWh; forcing start."
                 )
-                return True
+                return 'force_required_energy'
             else:
                 log.debug(
                     f"{self.log_prefix} Forecast {forecast_kwh:.2f} kWh still above required daily energy {self.required_daily_energy_kwh:.2f} kWh; waiting."
                 )
-                return False
+                return None
         else:
             if forecast_kwh is not None and forecast_kwh <= 0.0:
                 log.debug(f"{self.log_prefix} Forecast indicates no remaining PV energy; forcing start.")
-                return True
+                return 'force_no_forecast'
 
         try:
             start_datetime = datetime.datetime.combine(now.date(), self.start_time_if_target_not_met)
@@ -812,8 +888,8 @@ class PvAutostart:
             start_datetime = datetime.datetime.combine(now.date(), datetime.time(0, 0))
         if now >= start_datetime:
             log.debug(f"{self.log_prefix} Fallback start time reached; forcing start.")
-            return True
-        return False
+            return 'force_fallback'
+        return None
 
 
 
@@ -854,6 +930,8 @@ def reset_pv_autostart_counters():
             inst.running_since = None
             inst.started_by_script = False
             inst.current_run_counts = False
+            inst.last_start_reason = None
+            inst.forced_run_active = False
             inst.estimated_device_power_watts = None
             inst.on_counter_sec = 0.0
             inst.no_draw_counter_sec = 0.0
